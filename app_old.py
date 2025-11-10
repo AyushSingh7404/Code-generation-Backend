@@ -570,8 +570,8 @@ def is_modification_request(query: str, has_context: bool, has_previous_code: bo
     
     return (has_modification_keyword or has_reference) and (has_context or has_previous_code)
 
-
-def call_claude_bedrock(messages: List[Dict], system_prompt: str, model_id: str = "arn:aws:bedrock:us-east-1:529134784986:inference-profile/global.anthropic.claude-sonnet-4-20250514-v1:0") -> str:
+###### Place your correct model_id in the function call below ######
+def call_claude_bedrock(messages: List[Dict], system_prompt: str, model_id: str = "arn:aws:bedrock:us-east-1:52986:inference-profile/us.anthropic.claude-sonnet-4-20250514-v1:0") -> str:
     """
     Call Claude via AWS Bedrock with conversation history and prompt caching
     
@@ -889,7 +889,7 @@ if __name__ == "__main__":
         print("✓ AWS credentials configured")
         print("✓ Prompt caching enabled")
         print("✓ Conversation history enabled")
-        print("✓ Starting server on http://0.0.0.0:8000")
+        print("✓ Starting server on http://0.0.0.0:5000")
         print("=" * 60)
     
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=5000)

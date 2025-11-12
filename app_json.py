@@ -2,7 +2,7 @@ import os
 import json
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, File, UploadFile, Form
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import boto3
@@ -1089,7 +1089,7 @@ async def process_chat_request(request: ChatRequest) -> ChatResponse:
                 type="conversation",
                 parsed={
                     "type": "conversation",
-                    "summary": response.strip()
+                    "message": response.strip()
                 },
                 session_id=session_id,
                 is_code_change=False,
@@ -1105,7 +1105,7 @@ async def process_chat_request(request: ChatRequest) -> ChatResponse:
                 parsed={
                     "type": "error",
                     "error": f"Expected code generation but received unexpected response: {str(e)}",
-                    "summary": response.strip()
+                    "message": response.strip()
                 },
                 session_id=session_id,
                 is_code_change=False,
@@ -1121,83 +1121,27 @@ async def process_chat_request(request: ChatRequest) -> ChatResponse:
 # ============================================================================
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
-async def chat_endpoint(
-    query: str = Form(...),
-    session_id: str = Form(default="default"),
-    model_name: Optional[str] = Form(default=None),
-    workspace_tree: Optional[str] = Form(default=None),
-    files: List[UploadFile] = File(default=[])
-):
+async def chat_endpoint(request: ChatRequest):
     """
-    Process chat request with file uploads via multipart/form-data.
+    Process a chat request for React code generation or modification.
     
-    Form fields:
-    - query: User's request/query (required)
-    - session_id: Session identifier (default: "default")
-    - model_name: Model name like "claude-sonnet-4-5" (optional)
-    - workspace_tree: JSON string of workspace structure (optional)
-    - files: Multiple file uploads (optional)
+    Request body:
+    - **query**: The user's request/query
+    - **context**: Optional context including open files and workspace structure
+    - **session_id**: Session identifier for maintaining conversation history
+    - **model_name**: Optional model name (e.g., "claude-sonnet-4-5")
     
-    Response: ChatResponse with code generation/modification
+    Response types:
+    - "code_generation": New React code created
+    - "code_modification": Existing code modified
+    - "conversation": Chat response
+    - "error": Error occurred
     """
     try:
-        # Read uploaded files efficiently
-        file_contexts = []
-        for file in files:
-            try:
-                # Read file content
-                content = await file.read()
-                
-                # Decode to string (assumes text files)
-                try:
-                    text_content = content.decode('utf-8')
-                except UnicodeDecodeError:
-                    # Skip binary files or handle differently
-                    print(f"Warning: Skipping binary file {file.filename}")
-                    continue
-                
-                file_contexts.append(FileContext(
-                    path=file.filename,
-                    content=text_content
-                ))
-            except Exception as e:
-                print(f"Error reading file {file.filename}: {str(e)}")
-                continue
-        
-        # Parse workspace tree if provided
-        ws_tree = None
-        if workspace_tree:
-            try:
-                ws_tree = WorkspaceTree(**json.loads(workspace_tree))
-            except json.JSONDecodeError:
-                raise HTTPException(
-                    status_code=400, 
-                    detail="Invalid workspace_tree JSON format"
-                )
-        
-        # Build context
-        context = None
-        if file_contexts or ws_tree:
-            context = ChatContext(
-                open_files=file_contexts if file_contexts else None,
-                workspace_tree=ws_tree
-            )
-        
-        # Create request object
-        request = ChatRequest(
-            query=query,
-            context=context,
-            session_id=session_id,
-            model_name=model_name
-        )
-        
-        # Process request
         return await process_chat_request(request)
-    
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/reset", tags=["Session"])
 async def reset_session(request: ResetRequest):
@@ -1375,4 +1319,4 @@ if __name__ == "__main__":
     print("📚 API docs: http://0.0.0.0:8000/docs")
     print("=" * 70)
     
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)

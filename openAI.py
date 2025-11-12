@@ -5,7 +5,7 @@ from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-import boto3
+from openai import OpenAI
 import asyncio
 from collections import defaultdict
 import dotenv
@@ -15,9 +15,9 @@ dotenv.load_dotenv()
 
 # FastAPI app
 app = FastAPI(
-    title="React Code Assistant API",
-    description="AI-powered React code generation and modification assistant using AWS Bedrock",
-    version="2.0.0"
+    title="React Code Assistant API - OpenAI",
+    description="AI-powered React code generation and modification assistant using OpenAI GPT-4.1",
+    version="3.0.0"
 )
 
 # CORS
@@ -30,45 +30,37 @@ app.add_middleware(
 )
 
 # ============================================================================
-# AWS & MODEL CONFIGURATION
+# OPENAI CONFIGURATION
 # ============================================================================
 
-AWS_REGION = os.getenv('AWS_REGION', 'us-east-1')
-AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
-AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
-# Model ID mapping from environment variables
-# Frontend sends friendly names like "claude-sonnet-4-5"
-# Backend maps to actual ARNs
+# Model ID mapping - OpenAI model names
 MODEL_MAPPING = {
-    "claude-3-5-sonnet": os.getenv('CLAUDE_3_5_SONNET_ID'),
-    "claude-3-7-sonnet": os.getenv('CLAUDE_3_7_SONNET_ID'),
-    "claude-sonnet-4": os.getenv('CLAUDE_SONNET_4_ID'),
-    "claude-sonnet-4-5": os.getenv('CLAUDE_SONNET_4_5_ID'),
+    "gpt-4.1": "gpt-4.1-2025-04-14",
+    "gpt-4o": "gpt-4o-2024-11-20",
+    "gpt-4.1-mini": "gpt-4.1-mini-2025-04-14",
+    "o3": "o3-2025-01-31",
+    "o4-mini": "o4-mini-2025-01-31"
 }
 
-DEFAULT_MODEL = os.getenv('DEFAULT_MODEL', 'claude-sonnet-4-5')
+DEFAULT_MODEL = os.getenv('DEFAULT_MODEL', 'gpt-4.1')
 
 def get_model_id(model_name: Optional[str] = None) -> str:
     """
-    Convert friendly model name to AWS Bedrock ARN
+    Convert friendly model name to OpenAI model ID
     
     Args:
-        model_name: Friendly name like "claude-sonnet-4-5"
+        model_name: Friendly name like "gpt-4.1"
     
     Returns:
-        Full ARN for the model
+        Full OpenAI model ID
     """
     name = model_name or DEFAULT_MODEL
     return MODEL_MAPPING.get(name, MODEL_MAPPING[DEFAULT_MODEL])
 
-# Initialize Bedrock client
-bedrock_runtime = boto3.client(
-    service_name='bedrock-runtime',
-    region_name=AWS_REGION,
-    aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY
-)
+# Initialize OpenAI client
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ============================================================================
 # PYDANTIC MODELS
@@ -95,14 +87,13 @@ class ChatRequest(BaseModel):
     query: str
     context: Optional[ChatContext] = None
     session_id: str = "default"
-    model_name: Optional[str] = None  # e.g., "claude-sonnet-4-5"
+    model_name: Optional[str] = None  # e.g., "gpt-4.1"
 
 class TokenUsage(BaseModel):
-    """Token usage information from Claude API"""
+    """Token usage information from OpenAI API"""
     input_tokens: int
     output_tokens: int
-    cache_creation_input_tokens: Optional[int] = 0
-    cache_read_input_tokens: Optional[int] = 0
+    cached_tokens: Optional[int] = 0
 
 class ChatResponse(BaseModel):
     """
@@ -127,13 +118,14 @@ class ResetRequest(BaseModel):
     session_id: str = "default"
 
 # ============================================================================
-# PROMPTS - REACT-FOCUSED
+# PROMPTS - REACT-FOCUSED WITH OPENAI OPTIMIZATION
 # ============================================================================
 
-# SHORT System Prompt (Role Definition Only) - Will be cached
+# System Prompt - More explicit for GPT-4.1's literal instruction following
 MAIN_SYSTEM_PROMPT = """You are an expert React developer assistant specializing in modern React development with hooks, TypeScript, and best practices.
 
 <react_expertise>
+YOU MUST USE these React patterns and technologies:
 - Modern React with functional components and hooks (useState, useEffect, useContext, useReducer, useMemo, useCallback)
 - TypeScript for type safety and better developer experience
 - Component composition and prop drilling avoidance
@@ -149,38 +141,63 @@ MAIN_SYSTEM_PROMPT = """You are an expert React developer assistant specializing
 </react_expertise>
 
 <core_responsibilities>
-- Generate well-structured, production-ready React components
-- Modify existing React code accurately using line-based changes
-- Follow React best practices and modern patterns
-- Provide TypeScript types when appropriate
-- Respond naturally to casual conversation
-- Maintain context throughout conversations
+YOU MUST:
+1. Generate well-structured, production-ready React components
+2. Modify existing React code accurately using line-based changes
+3. Follow React best practices and modern patterns
+4. Provide TypeScript types when appropriate
+5. Respond naturally to casual conversation
+6. Maintain context throughout conversations
+7. Be EXTREMELY PRECISE with line numbers and modifications
+8. ALWAYS output valid JSON for code requests (no markdown, no code blocks)
+9. Include brief analysis before JSON output
 </core_responsibilities>
 
 <interaction_style>
-- For code requests: Provide structured JSON responses as instructed
+FOLLOW THESE RULES EXACTLY:
+- For code requests: Provide structured JSON responses as instructed in examples
 - For casual chat: Respond conversationally without JSON
 - Ask clarifying questions when requirements are ambiguous
 - Be precise and detail-oriented in code generation
+- NEVER add markdown code blocks around JSON output
+- ALWAYS escape special characters in JSON strings properly
 </interaction_style>
 
-You will receive task-specific instructions and examples in the conversation. Follow them carefully."""
+<agentic_behavior>
+YOU ARE AN AGENT - This means:
+1. PERSISTENCE: Keep working until the user's query is completely resolved before ending your turn
+2. TOOL AWARENESS: If you need information about files or code structure, ask the user (do NOT guess or make assumptions)
+3. PLANNING: For complex tasks, write a brief plan first, then execute
+4. REFLECTION: After generating code or modifications, verify they address all requirements
+5. STEP-BY-STEP: For multi-step tasks, break them down and explain your approach
+</agentic_behavior>
+
+You will receive task-specific instructions and examples in the conversation. Follow them EXACTLY as written."""
 
 
 # React Code Generation Examples and Instructions
 REACT_GENERATION_EXAMPLES = """<mode>REACT CODE GENERATION</mode>
 
 <instructions>
-You are now in React code generation mode. Follow this process:
+You are now in React code generation mode. FOLLOW THIS PROCESS EXACTLY:
 
 1. ANALYZE: Understand the React requirements and plan your component structure
 2. STRUCTURE: Determine the file organization (components, hooks, utils, styles)
 3. GENERATE: Create complete React code in JSON format
 
-CRITICAL OUTPUT FORMAT:
+CRITICAL OUTPUT FORMAT - FOLLOW EXACTLY:
 - Start with brief analysis (2-3 sentences explaining your approach)
-- Then output ONLY valid JSON (no markdown, no code blocks, no extra text)
+- Then output ONLY valid JSON (NO markdown, NO code blocks, NO extra text)
 - Format: [Brief reasoning] + JSON structure
+- DO NOT wrap JSON in ```json or ``` - output raw JSON only
+
+VALIDATION CHECKLIST:
+□ Brief analysis comes first (2-3 sentences)
+□ JSON starts immediately after analysis
+□ No markdown code blocks
+□ All quotes properly escaped
+□ All newlines as \\n
+□ Valid JSON structure
 </instructions>
 
 <json_structure>
@@ -197,7 +214,8 @@ CRITICAL OUTPUT FORMAT:
 </json_structure>
 
 <react_best_practices>
-1. Use functional components with hooks (not class components)
+FOLLOW THESE RULES EXACTLY:
+1. Use functional components with hooks (NEVER use class components)
 2. Destructure props for cleaner code
 3. Use proper TypeScript types when applicable (.tsx extension)
 4. Follow naming conventions: PascalCase for components, camelCase for functions
@@ -210,6 +228,7 @@ CRITICAL OUTPUT FORMAT:
 </react_best_practices>
 
 <file_structure_patterns>
+USE THESE FILE PATHS:
 - Components: src/components/ComponentName.jsx or .tsx
 - Hooks: src/hooks/useHookName.js
 - Utils: src/utils/utilName.js
@@ -264,53 +283,10 @@ I'll create a login form using useState for form state and validation logic, wit
 }
 </response>
 </example>
-
-<example name="api_data_fetching">
-<scenario>User: "Create a UserList component that fetches users from an API"</scenario>
-<response>
-I'll create a UserList component using useEffect for data fetching, with loading and error states.
-
-{
-  "type": "code_generation",
-  "changes": [
-    {
-      "file": "src/components/UserList.jsx",
-      "content": "import React, { useState, useEffect } from 'react';\\nimport './UserList.css';\\n\\nconst UserList = ({ apiUrl = 'https://jsonplaceholder.typicode.com/users' }) => {\\n  const [users, setUsers] = useState([]);\\n  const [loading, setLoading] = useState(true);\\n  const [error, setError] = useState(null);\\n\\n  useEffect(() => {\\n    const fetchUsers = async () => {\\n      try {\\n        setLoading(true);\\n        setError(null);\\n        \\n        const response = await fetch(apiUrl);\\n        \\n        if (!response.ok) {\\n          throw new Error(`HTTP error! status: ${response.status}`);\\n        }\\n        \\n        const data = await response.json();\\n        setUsers(data);\\n      } catch (err) {\\n        setError(err.message);\\n        console.error('Error fetching users:', err);\\n      } finally {\\n        setLoading(false);\\n      }\\n    };\\n\\n    fetchUsers();\\n  }, [apiUrl]);\\n\\n  if (loading) {\\n    return (\\n      <div className=\\"user-list-container\\">\\n        <div className=\\"loading\\">Loading users...</div>\\n      </div>\\n    );\\n  }\\n\\n  if (error) {\\n    return (\\n      <div className=\\"user-list-container\\">\\n        <div className=\\"error\\">Error: {error}</div>\\n      </div>\\n    );\\n  }\\n\\n  return (\\n    <div className=\\"user-list-container\\">\\n      <h2>User List</h2>\\n      <div className=\\"user-grid\\">\\n        {users.map(user => (\\n          <div key={user.id} className=\\"user-card\\">\\n            <h3>{user.name}</h3>\\n            <p className=\\"username\\">@{user.username}</p>\\n            <p className=\\"email\\">{user.email}</p>\\n            <p className=\\"company\\">{user.company.name}</p>\\n          </div>\\n        ))}\\n      </div>\\n    </div>\\n  );\\n};\\n\\nexport default UserList;"
-    },
-    {
-      "file": "src/components/UserList.css",
-      "content": ".user-list-container {\\n  padding: 2rem;\\n  max-width: 1200px;\\n  margin: 0 auto;\\n}\\n\\n.user-list-container h2 {\\n  text-align: center;\\n  color: #333;\\n  margin-bottom: 2rem;\\n}\\n\\n.loading, .error {\\n  text-align: center;\\n  padding: 2rem;\\n  font-size: 1.2rem;\\n}\\n\\n.error {\\n  color: #e74c3c;\\n}\\n\\n.user-grid {\\n  display: grid;\\n  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));\\n  gap: 1.5rem;\\n}\\n\\n.user-card {\\n  background: white;\\n  padding: 1.5rem;\\n  border-radius: 10px;\\n  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);\\n  transition: transform 0.2s, box-shadow 0.2s;\\n}\\n\\n.user-card:hover {\\n  transform: translateY(-5px);\\n  box-shadow: 0 10px 20px rgba(0, 0, 0, 0.15);\\n}\\n\\n.user-card h3 {\\n  margin: 0 0 0.5rem 0;\\n  color: #667eea;\\n}\\n\\n.username {\\n  color: #7f8c8d;\\n  font-style: italic;\\n  margin: 0.25rem 0;\\n}\\n\\n.email {\\n  color: #555;\\n  font-size: 0.9rem;\\n  margin: 0.5rem 0;\\n}\\n\\n.company {\\n  color: #95a5a6;\\n  font-size: 0.85rem;\\n  margin: 0.5rem 0 0 0;\\n}"
-    }
-  ],
-  "summary": "Created UserList component with useEffect for API data fetching, loading/error states, and responsive grid layout"
-}
-</response>
-</example>
-
-<example name="custom_hook">
-<scenario>User: "Create a custom hook for form handling"</scenario>
-<response>
-I'll create a reusable useForm custom hook that handles form state, validation, and submission.
-
-{
-  "type": "code_generation",
-  "changes": [
-    {
-      "file": "src/hooks/useForm.js",
-      "content": "import { useState } from 'react';\\n\\nconst useForm = (initialValues, validate, onSubmit) => {\\n  const [values, setValues] = useState(initialValues);\\n  const [errors, setErrors] = useState({});\\n  const [isSubmitting, setIsSubmitting] = useState(false);\\n\\n  const handleChange = (e) => {\\n    const { name, value } = e.target;\\n    setValues(prev => ({ ...prev, [name]: value }));\\n    \\n    // Clear error for this field\\n    if (errors[name]) {\\n      setErrors(prev => ({ ...prev, [name]: '' }));\\n    }\\n  };\\n\\n  const handleSubmit = async (e) => {\\n    e.preventDefault();\\n    \\n    // Validate\\n    const validationErrors = validate ? validate(values) : {};\\n    setErrors(validationErrors);\\n    \\n    // If no errors, submit\\n    if (Object.keys(validationErrors).length === 0) {\\n      setIsSubmitting(true);\\n      try {\\n        await onSubmit(values);\\n      } catch (error) {\\n        setErrors({ submit: error.message });\\n      } finally {\\n        setIsSubmitting(false);\\n      }\\n    }\\n  };\\n\\n  const reset = () => {\\n    setValues(initialValues);\\n    setErrors({});\\n    setIsSubmitting(false);\\n  };\\n\\n  return {\\n    values,\\n    errors,\\n    isSubmitting,\\n    handleChange,\\n    handleSubmit,\\n    reset\\n  };\\n};\\n\\nexport default useForm;"
-    },
-    {
-      "file": "src/components/ExampleFormWithHook.jsx",
-      "content": "import React from 'react';\\nimport useForm from '../hooks/useForm';\\n\\nconst ExampleFormWithHook = () => {\\n  const initialValues = {\\n    name: '',\\n    email: '',\\n    message: ''\\n  };\\n\\n  const validate = (values) => {\\n    const errors = {};\\n    \\n    if (!values.name) {\\n      errors.name = 'Name is required';\\n    }\\n    \\n    if (!values.email) {\\n      errors.email = 'Email is required';\\n    } else if (!/^[^\\\\s@]+@[^\\\\s@]+\\\\.[^\\\\s@]+$/.test(values.email)) {\\n      errors.email = 'Invalid email format';\\n    }\\n    \\n    if (!values.message) {\\n      errors.message = 'Message is required';\\n    }\\n    \\n    return errors;\\n  };\\n\\n  const handleFormSubmit = async (values) => {\\n    // Simulate API call\\n    await new Promise(resolve => setTimeout(resolve, 1000));\\n    console.log('Form submitted:', values);\\n    alert('Form submitted successfully!');\\n  };\\n\\n  const { values, errors, isSubmitting, handleChange, handleSubmit, reset } = useForm(\\n    initialValues,\\n    validate,\\n    handleFormSubmit\\n  );\\n\\n  return (\\n    <form onSubmit={handleSubmit} style={{ maxWidth: '400px', margin: '0 auto', padding: '2rem' }}>\\n      <h2>Contact Form (using useForm hook)</h2>\\n      \\n      <div style={{ marginBottom: '1rem' }}>\\n        <label>Name:</label>\\n        <input\\n          type=\\"text\\"\\n          name=\\"name\\"\\n          value={values.name}\\n          onChange={handleChange}\\n          style={{ width: '100%', padding: '0.5rem' }}\\n        />\\n        {errors.name && <span style={{ color: 'red' }}>{errors.name}</span>}\\n      </div>\\n      \\n      <div style={{ marginBottom: '1rem' }}>\\n        <label>Email:</label>\\n        <input\\n          type=\\"email\\"\\n          name=\\"email\\"\\n          value={values.email}\\n          onChange={handleChange}\\n          style={{ width: '100%', padding: '0.5rem' }}\\n        />\\n        {errors.email && <span style={{ color: 'red' }}>{errors.email}</span>}\\n      </div>\\n      \\n      <div style={{ marginBottom: '1rem' }}>\\n        <label>Message:</label>\\n        <textarea\\n          name=\\"message\\"\\n          value={values.message}\\n          onChange={handleChange}\\n          style={{ width: '100%', padding: '0.5rem', minHeight: '100px' }}\\n        />\\n        {errors.message && <span style={{ color: 'red' }}>{errors.message}</span>}\\n      </div>\\n      \\n      <button type=\\"submit\\" disabled={isSubmitting} style={{ marginRight: '1rem' }}>\\n        {isSubmitting ? 'Submitting...' : 'Submit'}\\n      </button>\\n      <button type=\\"button\\" onClick={reset}>Reset</button>\\n    </form>\\n  );\\n};\\n\\nexport default ExampleFormWithHook;"
-    }
-  ],
-  "summary": "Created reusable useForm custom hook with form state management, validation, and example usage component"
-}
-</response>
-</example>
 </examples>
 
 <critical_reminders>
+REMEMBER - FOLLOW EXACTLY:
 - Output brief analysis (2-3 sentences) then ONLY the JSON structure
 - No markdown code blocks (```)
 - Use proper React patterns and hooks
@@ -327,17 +303,28 @@ I'll create a reusable useForm custom hook that handles form state, validation, 
 REACT_MODIFICATION_EXAMPLES = """<mode>REACT CODE MODIFICATION</mode>
 
 <instructions>
-You are now in React code modification mode. Follow this process:
+You are now in React code modification mode. FOLLOW THIS PROCESS EXACTLY:
 
 1. ANALYZE: Understand what React code needs to be changed and why
-2. LOCATE: Identify exact line numbers and content to modify
+2. LOCATE: Identify EXACT line numbers and content to modify
 3. MODIFY: Provide precise line-based changes in JSON format
 
-CRITICAL OUTPUT FORMAT:
+CRITICAL OUTPUT FORMAT - FOLLOW EXACTLY:
 - Start with brief analysis (2-3 sentences explaining your changes)
-- Then output ONLY valid JSON (no markdown, no code blocks, no extra text)
+- Then output ONLY valid JSON (NO markdown, NO code blocks, NO extra text)
 - Format: [Brief reasoning] + JSON structure
 - NOTE: Do NOT include "old_content" field - only provide line numbers and new content
+- BE EXTREMELY PRECISE with line numbers - they are 1-indexed (first line is 1)
+
+VALIDATION CHECKLIST:
+□ Brief analysis comes first (2-3 sentences)
+□ JSON starts immediately after analysis
+□ No markdown code blocks
+□ Line numbers are EXACT and 1-indexed
+□ All quotes properly escaped
+□ All newlines as \\n
+□ Valid JSON structure
+□ NO "old_content" field
 </instructions>
 
 <json_structure>
@@ -364,17 +351,19 @@ CRITICAL OUTPUT FORMAT:
 <operation name="replace">
 Purpose: Change existing lines in the React component
 Required fields:
-- start_line: First line number to replace (1-indexed)
-- end_line: Last line number to replace (inclusive, 1-indexed)
+- start_line: First line number to replace (1-indexed, MUST BE EXACT)
+- end_line: Last line number to replace (inclusive, 1-indexed, MUST BE EXACT)
 - new_content: New content to insert (NO old_content field needed)
 
 Use when: Modifying existing code, fixing bugs, updating values, changing props
+
+CRITICAL: Count line numbers EXACTLY - include ALL lines (even blank lines)
 </operation>
 
 <operation name="insert">
 Purpose: Add new lines AFTER a specified line
 Required fields:
-- start_line: Line number after which to insert (1-indexed)
+- start_line: Line number after which to insert (1-indexed, MUST BE EXACT)
 - new_content: Content to insert
 
 Use when: Adding new hooks, props, state, functions
@@ -383,7 +372,7 @@ Use when: Adding new hooks, props, state, functions
 <operation name="insert_before">
 Purpose: Add new lines BEFORE a specified line
 Required fields:
-- start_line: Line number before which to insert (1-indexed)
+- start_line: Line number before which to insert (1-indexed, MUST BE EXACT)
 - new_content: Content to insert
 
 Use when: Adding imports, adding code before existing logic
@@ -392,14 +381,15 @@ Use when: Adding imports, adding code before existing logic
 <operation name="delete">
 Purpose: Remove lines from the file
 Required fields:
-- start_line: First line number to delete (1-indexed)
-- end_line: Last line number to delete (inclusive, 1-indexed)
+- start_line: First line number to delete (1-indexed, MUST BE EXACT)
+- end_line: Last line number to delete (inclusive, 1-indexed, MUST BE EXACT)
 
 Use when: Removing unnecessary code, unused imports, deprecated props
 </operation>
 </operations>
 
 <react_modification_patterns>
+FOLLOW THESE PATTERNS:
 1. Adding state: Insert useState hook after existing hooks
 2. Adding props: Modify component function signature
 3. Adding event handlers: Insert new function before return statement
@@ -411,6 +401,7 @@ Use when: Removing unnecessary code, unused imports, deprecated props
 </react_modification_patterns>
 
 <rules>
+FOLLOW THESE RULES EXACTLY:
 1. Line numbers are 1-indexed (first line of file is line 1)
 2. NO "old_content" field - frontend handles line identification
 3. Preserve proper indentation in new_content
@@ -418,6 +409,7 @@ Use when: Removing unnecessary code, unused imports, deprecated props
 5. Use \\n to represent line breaks in new_content strings
 6. Escape quotes and backslashes properly
 7. Ensure JSON is valid and parseable
+8. COUNT LINE NUMBERS EXACTLY - include blank lines, comments, everything
 </rules>
 
 <examples>
@@ -518,104 +510,10 @@ I'll update the backgroundColor in the style prop from blue to green.
 }
 </response>
 </example>
-
-<example>
-<scenario>
-User: "Add error handling to the API call in UserList.jsx"
-
-Current file (UserList.jsx):
-Line 1: import React, { useState, useEffect } from 'react';
-Line 2: 
-Line 3: const UserList = () => {
-Line 4:   const [users, setUsers] = useState([]);
-Line 5:   const [loading, setLoading] = useState(true);
-Line 6:   
-Line 7:   useEffect(() => {
-Line 8:     fetch('/api/users')
-Line 9:       .then(res => res.json())
-Line 10:       .then(data => setUsers(data))
-Line 11:       .finally(() => setLoading(false));
-Line 12:   }, []);
-Line 13:   
-Line 14:   return (
-Line 15:     <div>{/* ... */}</div>
-Line 16:   );
-Line 17: };
-</scenario>
-<response>
-I'll add error state and error handling with try-catch in the useEffect hook.
-
-{
-  "type": "code_changes",
-  "changes": [
-    {
-      "file": "UserList.jsx",
-      "modifications": [
-        {
-          "operation": "insert",
-          "start_line": 5,
-          "new_content": "  const [error, setError] = useState(null);"
-        },
-        {
-          "operation": "replace",
-          "start_line": 7,
-          "end_line": 12,
-          "new_content": "  useEffect(() => {\\n    const fetchUsers = async () => {\\n      try {\\n        setLoading(true);\\n        setError(null);\\n        const response = await fetch('/api/users');\\n        if (!response.ok) throw new Error('Failed to fetch');\\n        const data = await response.json();\\n        setUsers(data);\\n      } catch (err) {\\n        setError(err.message);\\n      } finally {\\n        setLoading(false);\\n      }\\n    };\\n    fetchUsers();\\n  }, []);"
-        }
-      ]
-    }
-  ],
-  "summary": "Added error state and comprehensive error handling with try-catch for API call"
-}
-</response>
-</example>
-
-<example>
-<scenario>
-User: "Add a new prop 'disabled' to the Button component and use it"
-
-Current file (Button.jsx):
-Line 1: import React from 'react';
-Line 2: 
-Line 3: const Button = ({ onClick, children }) => {
-Line 4:   return (
-Line 5:     <button onClick={onClick}>
-Line 6:       {children}
-Line 7:     </button>
-Line 8:   );
-Line 9: };
-</scenario>
-<response>
-I'll add the disabled prop to the component signature and apply it to the button element.
-
-{
-  "type": "code_changes",
-  "changes": [
-    {
-      "file": "Button.jsx",
-      "modifications": [
-        {
-          "operation": "replace",
-          "start_line": 3,
-          "end_line": 3,
-          "new_content": "const Button = ({ onClick, children, disabled = false }) => {"
-        },
-        {
-          "operation": "replace",
-          "start_line": 5,
-          "end_line": 5,
-          "new_content": "    <button onClick={onClick} disabled={disabled}>"
-        }
-      ]
-    }
-  ],
-  "summary": "Added disabled prop with default value false and applied it to button element"
-}
-</response>
-</example>
 </examples>
 
 <critical_reminders>
+REMEMBER - FOLLOW EXACTLY:
 - Output brief analysis (2-3 sentences) then ONLY the JSON structure
 - NO "old_content" field - not needed for frontend
 - No markdown code blocks (```)
@@ -624,40 +522,37 @@ I'll add the disabled prop to the component signature and apply it to the button
 - Ensure JSON is valid and parseable
 - List modifications in top-to-bottom order per file
 - Preserve proper React component structure and indentation
+- BE EXTREMELY PRECISE with line numbers - count EXACTLY
 </critical_reminders>"""
 
 
-# Unified Examples Conversation - This gets cached once per session
+# Unified Examples Conversation - Optimized for OpenAI automatic caching
 UNIFIED_EXAMPLES_CONVERSATION = [
     {
         "role": "user",
-        "content": [
-            {
-                "type": "text",
-                "text": f"{REACT_GENERATION_EXAMPLES}\n\n---\n\n{REACT_MODIFICATION_EXAMPLES}",
-                "cache_control": {"type": "ephemeral"}
-            }
-        ]
+        "content": f"{REACT_GENERATION_EXAMPLES}\n\n---\n\n{REACT_MODIFICATION_EXAMPLES}"
     },
     {
         "role": "assistant",
-        "content": "I understand both React code generation and modification formats. For generation requests, I will create complete React components with proper hooks, state management, and styling in JSON format. For modification requests, I will provide precise line-based changes using the appropriate operations (replace, insert, insert_before, delete) WITHOUT including old_content field. I will always start with brief analysis, then output only valid JSON without markdown or extra text."
+        "content": "I understand both React code generation and modification formats EXACTLY. For generation requests, I will create complete React components with proper hooks, state management, and styling in JSON format. For modification requests, I will provide precise line-based changes using the appropriate operations (replace, insert, insert_before, delete) WITHOUT including old_content field. I will ALWAYS start with brief analysis, then output ONLY valid JSON without markdown or extra text. I will be EXTREMELY PRECISE with line numbers and count them EXACTLY including all blank lines."
     }
 ]
 
 
 # ============================================================================
-# CONVERSATION BUFFER - IMPROVED WITH CACHING SUPPORT
+# CONVERSATION BUFFER - OPTIMIZED FOR OPENAI AUTOMATIC CACHING
 # ============================================================================
 
 class ConversationBuffer:
     """
-    Manages conversation history with caching support for examples
+    Manages conversation history optimized for OpenAI's automatic prompt caching
     
-    Caching strategy:
-    1. System prompt: Always cached
-    2. Examples (first 2 messages): Cached once per session
-    3. Conversation history: Older messages cached when >3 messages
+    Caching strategy (automatic by OpenAI):
+    1. Static content (examples) at the beginning - gets cached automatically
+    2. Conversation history in the middle - cached when >1024 tokens
+    3. Recent dynamic content at the end - not cached
+    
+    OpenAI caches the longest prefix >1024 tokens automatically
     """
     
     def __init__(self, max_messages=20):
@@ -668,7 +563,7 @@ class ConversationBuffer:
     def inject_examples(self):
         """
         Inject unified React examples at the start of conversation (only once)
-        This is cached and reused throughout the session
+        OpenAI will automatically cache this when >1024 tokens
         """
         if not self.examples_injected and not self.messages:
             self.messages = UNIFIED_EXAMPLES_CONVERSATION.copy()
@@ -685,7 +580,7 @@ class ConversationBuffer:
     def _trim_if_needed(self):
         """
         Keep recent messages but PRESERVE examples at start
-        Maintains conversation window while keeping cached examples
+        Maintains conversation window while keeping cacheable examples
         """
         if len(self.messages) > self.max_messages:
             if self.examples_injected:
@@ -703,78 +598,14 @@ class ConversationBuffer:
     
     def get_messages_for_api(self) -> List[Dict]:
         """
-        Get messages formatted for Claude API with cache control
+        Get messages formatted for OpenAI API
         
-        Caching layers:
-        1. Examples (first 2 msgs): Already have cache_control
-        2. Older conversation: Cache when >3 messages (changed from >5)
-        3. Recent 3 messages: Not cached (kept fresh)
+        OpenAI's automatic caching will handle optimization:
+        - Caches longest prefix >1024 tokens
+        - Examples at start get cached automatically
+        - Recent messages stay dynamic
         """
-        # Changed threshold from 5 to 3 for more aggressive caching
-        if len(self.messages) <= 3:
-            # Too few messages to benefit from additional caching
-            return self.messages
-        
-        # Examples (first 2 messages) are already cached
-        # Cache conversation history too (all but last 3 messages after examples)
-        if self.examples_injected:
-            examples = self.messages[:2]  # Already have cache control
-            conversation = self.messages[2:]
-            
-            if len(conversation) <= 3:
-                # Not enough conversation to cache
-                return self.messages
-            
-            # Split conversation into cacheable and recent
-            cacheable_conversation = conversation[:-3]
-            recent_conversation = conversation[-3:]
-            
-            formatted = examples.copy()
-            
-            # Add cacheable conversation messages
-            for i, msg in enumerate(cacheable_conversation):
-                formatted_msg = {"role": msg["role"], "content": msg["content"]}
-                
-                # Add cache control to LAST message in cacheable block
-                if i == len(cacheable_conversation) - 1:
-                    formatted_msg["content"] = [
-                        {
-                            "type": "text",
-                            "text": msg["content"],
-                            "cache_control": {"type": "ephemeral"}
-                        }
-                    ]
-                
-                formatted.append(formatted_msg)
-            
-            # Add recent messages without caching
-            formatted.extend(recent_conversation)
-            
-            return formatted
-        else:
-            # No examples injected, cache older messages only
-            messages_to_cache = self.messages[:-3]
-            recent_messages = self.messages[-3:]
-            
-            formatted = []
-            
-            for i, msg in enumerate(messages_to_cache):
-                formatted_msg = {"role": msg["role"], "content": msg["content"]}
-                
-                if i == len(messages_to_cache) - 1:
-                    formatted_msg["content"] = [
-                        {
-                            "type": "text",
-                            "text": msg["content"],
-                            "cache_control": {"type": "ephemeral"}
-                        }
-                    ]
-                
-                formatted.append(formatted_msg)
-            
-            formatted.extend(recent_messages)
-            
-            return formatted
+        return self.messages
     
     def clear(self):
         """Clear conversation history"""
@@ -819,8 +650,8 @@ def is_modification_request(query: str, has_context: bool, has_previous_code: bo
     """
     Determine if request is for modification vs generation
     
-    This is a HINT for Claude, not a hard rule.
-    Claude can self-correct if classification is wrong.
+    This is a HINT for the model, not a hard rule.
+    Model can self-correct if classification is wrong.
     """
     modification_keywords = [
         'change', 'modify', 'update', 'fix', 'add', 'remove', 'delete',
@@ -857,63 +688,63 @@ def is_likely_code_request(query: str) -> bool:
     return any(keyword in query_lower for keyword in code_keywords)
 
 
-def call_claude_bedrock(
+def call_openai_chat(
     messages: List[Dict], 
     system_prompt: str, 
     model_name: Optional[str] = None
 ) -> tuple[str, Dict[str, int]]:
     """
-    Call Claude via AWS Bedrock with conversation history and prompt caching
+    Call OpenAI Chat Completions API with automatic prompt caching
     
     Args:
-        messages: Full conversation history with cache control
-        system_prompt: System-level role definition (will be cached)
-        model_name: Friendly model name (e.g., "claude-sonnet-4-5")
+        messages: Full conversation history (examples + conversation)
+        system_prompt: System-level role definition
+        model_name: Friendly model name (e.g., "gpt-4.1")
     
     Returns:
         tuple: (response_text, usage_dict)
         
-    Caching strategy:
-    - System prompt: Always cached
-    - Examples in messages: Cached via cache_control in message content
-    - Older conversation: Cached via cache_control in message content
+    Caching strategy (automatic by OpenAI):
+    - Static content >1024 tokens at start gets cached
+    - Cache lifetime: 5-10 minutes
+    - 75% discount on cached tokens for GPT-4.1
     """
     try:
         # Get actual model ID from friendly name
         model_id = get_model_id(model_name)
         
-        # Cache system prompt (500 tokens cached every request)
-        system_blocks = [
-            {
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": {"type": "ephemeral"}
-            }
-        ]
+        # Structure messages: system first, then conversation history
+        full_messages = [
+            {"role": "system", "content": system_prompt}
+        ] + messages
         
-        request_body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 4096,
-            "system": system_blocks,
-            "messages": messages,  # Includes cached examples and conversation
-            "temperature": 0.3
-        }
-        
-        response = bedrock_runtime.invoke_model(
-            modelId=model_id,
-            body=json.dumps(request_body)
+        # Call OpenAI API
+        response = client.chat.completions.create(
+            model=model_id,
+            messages=full_messages,
+            max_tokens=4096,
+            temperature=0.3
         )
         
-        response_body = json.loads(response['body'].read())
+        # Extract response text
+        response_text = response.choices[0].message.content
         
-        # Extract response text and usage information
-        response_text = response_body['content'][0]['text']
-        usage = response_body.get('usage', {})
+        # Extract usage information
+        usage = {
+            "input_tokens": response.usage.prompt_tokens,
+            "output_tokens": response.usage.completion_tokens,
+            "cached_tokens": 0
+        }
+        
+        # Get cached tokens if available (GPT-4.1 and newer)
+        if hasattr(response.usage, 'prompt_tokens_details') and response.usage.prompt_tokens_details:
+            if hasattr(response.usage.prompt_tokens_details, 'cached_tokens'):
+                usage["cached_tokens"] = response.usage.prompt_tokens_details.cached_tokens
         
         return response_text, usage
     
     except Exception as e:
-        raise Exception(f"Bedrock API Error: {str(e)}")
+        raise Exception(f"OpenAI API Error: {str(e)}")
 
 
 def sort_and_apply_modifications(changes: List[Dict]) -> List[Dict]:
@@ -971,7 +802,7 @@ active_connections: Dict[str, WebSocket] = {}
 
 async def process_chat_request(request: ChatRequest) -> ChatResponse:
     """
-    Process chat request with full conversation history and caching
+    Process chat request with full conversation history and automatic caching
     
     Response types:
     - "code_generation": New React components/files created
@@ -994,20 +825,20 @@ async def process_chat_request(request: ChatRequest) -> ChatResponse:
     has_context = context is not None and (context.open_files or context.workspace_tree)
     
     # Inject React examples ONCE at start of conversation
-    # These are cached and reused throughout the session
+    # OpenAI will automatically cache these (>1024 tokens)
     if not conv_buffer.examples_injected:
         conv_buffer.inject_examples()
     
     # Build context string with XML structure
     context_string = build_context_string(context)
     
-    # Determine if modification or generation (hint for Claude)
+    # Determine if modification or generation (hint for model)
     is_modification = is_modification_request(query, has_context, has_previous_code)
     
-    # Use SHORT system prompt (no examples - they're in conversation history)
+    # Use system prompt (optimized for GPT-4.1)
     system_prompt = MAIN_SYSTEM_PROMPT
     
-    # Build current user message (NO EXAMPLES - already cached in history)
+    # Build current user message
     current_message_parts = []
     
     # Add context if available
@@ -1024,11 +855,11 @@ async def process_chat_request(request: ChatRequest) -> ChatResponse:
     # Add user message to conversation history
     conv_buffer.add_message("user", current_message)
     
-    # Get full conversation history (includes cached examples)
+    # Get full conversation history (includes examples for automatic caching)
     messages = conv_buffer.get_messages_for_api()
     
-    # Call Claude with full history and get usage info
-    response, usage = call_claude_bedrock(messages, system_prompt, model_name)
+    # Call OpenAI with full history and get usage info
+    response, usage = call_openai_chat(messages, system_prompt, model_name)
     
     # Add assistant response to history
     conv_buffer.add_message("assistant", response)
@@ -1037,8 +868,7 @@ async def process_chat_request(request: ChatRequest) -> ChatResponse:
     token_usage = TokenUsage(
         input_tokens=usage.get('input_tokens', 0),
         output_tokens=usage.get('output_tokens', 0),
-        cache_creation_input_tokens=usage.get('cache_creation_input_tokens', 0),
-        cache_read_input_tokens=usage.get('cache_read_input_tokens', 0)
+        cached_tokens=usage.get('cached_tokens', 0)
     )
     
     # Parse JSON response or handle as conversation
@@ -1099,7 +929,7 @@ async def process_chat_request(request: ChatRequest) -> ChatResponse:
                 model_name=model_name or DEFAULT_MODEL
             )
         else:
-            # User wanted code but Claude didn't provide JSON - error state
+            # User wanted code but model didn't provide JSON - error state
             return ChatResponse(
                 type="error",
                 parsed={
@@ -1134,7 +964,7 @@ async def chat_endpoint(
     Form fields:
     - query: User's request/query (required)
     - session_id: Session identifier (default: "default")
-    - model_name: Model name like "claude-sonnet-4-5" (optional)
+    - model_name: Model name like "gpt-4.1" (optional)
     - workspace_tree: JSON string of workspace structure (optional)
     - files: Multiple file uploads (optional)
     
@@ -1242,7 +1072,7 @@ async def get_code(session_id: str):
 
 @app.get("/models", tags=["System"])
 async def get_available_models():
-    """Get list of available Claude models"""
+    """Get list of available OpenAI models"""
     return {
         "models": list(MODEL_MAPPING.keys()),
         "default": DEFAULT_MODEL
@@ -1274,7 +1104,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     {
       "query": "your request", 
       "context": {...},
-      "model_name": "claude-sonnet-4-5"  // optional
+      "model_name": "gpt-4.1"  // optional
     }
     
     Receive JSON: ChatResponse model
@@ -1315,18 +1145,20 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 async def root():
     """Root endpoint with API information"""
     return {
-        "message": "React Code Assistant API v2.0",
-        "version": "2.0.0",
+        "message": "React Code Assistant API v3.0 - OpenAI Edition",
+        "version": "3.0.0",
         "specialized": "React development with modern hooks and TypeScript",
+        "provider": "OpenAI",
         "features": [
             "React-focused code generation and modification",
             "Conversation history with context awareness",
-            "Prompt caching for cost optimization (70-80% savings)",
+            "Automatic prompt caching (75% discount on cached tokens)",
             "Unified React examples (generation + modification)",
             "XML-structured context handling",
-            "Token usage tracking",
-            "Multi-model support via environment variables",
-            "No old_content in modification responses"
+            "Token usage tracking with cache metrics",
+            "Multi-model support (GPT-4.1, GPT-4o, o3, o4-mini)",
+            "No old_content in modification responses",
+            "Optimized for GPT-4.1's literal instruction following"
         ],
         "models": list(MODEL_MAPPING.keys()),
         "default_model": DEFAULT_MODEL,
@@ -1343,36 +1175,36 @@ if __name__ == "__main__":
     import uvicorn
     
     print("=" * 70)
-    print("React Code Assistant API v2.0")
+    print("React Code Assistant API v3.0 - OpenAI Edition")
     print("=" * 70)
     
-    # Check AWS credentials
-    if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
-        print("⚠️  WARNING: AWS credentials not set!")
+    # Check OpenAI API key
+    if not OPENAI_API_KEY:
+        print("⚠️  WARNING: OpenAI API key not set!")
         print("Required environment variables:")
-        print("  - AWS_ACCESS_KEY_ID")
-        print("  - AWS_SECRET_ACCESS_KEY")
-        print("  - AWS_REGION (optional, defaults to us-east-1)")
+        print("  - OPENAI_API_KEY")
         print("=" * 70)
     else:
-        print("✅ AWS credentials configured")
+        print("✅ OpenAI API key configured")
     
     # Show model configuration
     print(f"✅ Available models: {len(MODEL_MAPPING)}")
     for model_name, model_id in MODEL_MAPPING.items():
         is_default = " (DEFAULT)" if model_name == DEFAULT_MODEL else ""
-        print(f"   - {model_name}{is_default}")
-        print(f"     {model_id[:50]}...")
+        print(f"   - {model_name}{is_default}: {model_id}")
     
     print("\n🎯 Specialized for: React development")
-    print("✅ Prompt caching enabled (3-layer strategy)")
+    print("✅ Automatic prompt caching enabled (OpenAI)")
+    print("✅ 75% discount on cached tokens (GPT-4.1)")
+    print("✅ Cache threshold: >1024 tokens")
+    print("✅ Cache lifetime: 5-10 minutes")
     print("✅ Conversation history enabled")
-    print("✅ Token usage tracking enabled")
+    print("✅ Token usage tracking with cache metrics")
     print("✅ React-specific examples loaded")
-    print("✅ History caching threshold: >3 messages")
+    print("✅ Optimized for GPT-4.1 literal instruction following")
     print("❌ old_content removed from modifications")
-    print("\n🚀 Starting server on http://0.0.0.0:8000")
-    print("📚 API docs: http://0.0.0.0:8000/docs")
+    print("\n🚀 Starting server on http://0.0.0.0:5000")
+    print("📚 API docs: http://0.0.0.0:5000/docs")
     print("=" * 70)
     
     uvicorn.run(app, host="0.0.0.0", port=5000)

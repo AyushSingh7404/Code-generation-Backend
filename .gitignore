@@ -1,3 +1,4 @@
 .env
+.envold
 venv/
-dummy.py
+__pycache__/
